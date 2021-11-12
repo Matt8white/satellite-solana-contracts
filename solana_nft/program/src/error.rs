@@ -12,10 +12,16 @@ use thiserror::Error;
 /// Errors that may be returned by the NFT program.
 #[derive(Clone, Debug, Eq, Error, FromPrimitive, PartialEq)]
 pub enum NftError {
-    #[error("Signer neither owner or approval of token")]
-    SignerNotOwnerOrApproval,
-    #[error("Signer has to many sols to get burned account sols")]
-    Overflow,
+    #[error("Metadata differs from Mint provided")]
+    MetadataMismatch,
+    #[error("Wrong NFT Edition or Master edition already used")]
+    WrongEdition,
+    #[error("Satellite must be listed as one of the creators")]
+    SatelliteMustListAmongCreators,
+    #[error("Sales not ended for given Master Edition")]
+    OngoingSales,
+    #[error("Master edition not owned")]
+    NotOwned,
 }
 impl From<NftError> for ProgramError {
     fn from(e: NftError) -> Self {

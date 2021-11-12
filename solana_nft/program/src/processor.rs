@@ -2,254 +2,266 @@
 
 use crate::{
     error::NftError,
-    instruction::{MintData, NftInstruction, TokenDataArgs},
-    state::{Mint, MintVersion, Token, TokenDataStatus, TokenStatus},
+    instruction::{NftInstruction},
 };
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::{BorshDeserialize};//, BorshSerialize};
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
-    pubkey::Pubkey, rent::Rent, sysvar::Sysvar,
+    program::{invoke, invoke_signed},
+    account_info::next_account_info,
+    account_info::AccountInfo,
+    entrypoint::ProgramResult,
+    msg,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    // sysvar::{rent::Rent, Sysvar},
 };
+
+use spl_token;
+use spl_associated_token_account;
+use metaplex_token_metadata;
+use solana_program::program_pack::Pack;
 
 /// Program state handler.
 pub struct Processor {}
 impl Processor {
     /// Seed
+    pub const RELAYER_SEED: &'static str = "relayer";
     pub const TOKEN_DATA_SEED: &'static str = "token_data";
 
-    /// Initialize the mint
-    pub fn process_initialize_mint(
+    /// Stake Master Edition token
+    pub fn process_stake_master_edition(
         program_id: &Pubkey,
-        mint: &AccountInfo,
-        data: MintData,
-        rent: &AccountInfo,
-        authority: &AccountInfo,
+        accounts: &[AccountInfo],
     ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let mint_info = next_account_info(account_info_iter)?;
+        let user_associated_token_account = next_account_info(account_info_iter)?;
+        let pda_relayer_account = next_account_info(account_info_iter)?;
+        let update_authority = next_account_info(account_info_iter)?;
+        let metadata_info = next_account_info(account_info_iter)?;
+        let master_edition_info = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
+
         // validate
-        if data.symbol == [0; 8] || data.name.is_empty() {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-
-        validate_program(&program_id, &mint)?;
-
-        if !authority.is_signer {
+        let metadata = metaplex_token_metadata::state::Metadata::from_account_info(metadata_info)?;
+        if !update_authority.is_signer || metadata.update_authority == *update_authority.key {
             return Err(ProgramError::MissingRequiredSignature);
         }
-
-        if !Rent::from_account_info(rent)?.is_exempt(mint.lamports(), Mint::LEN as usize) {
-            return Err(ProgramError::AccountNotRentExempt);
+        if metadata.mint != *mint_info.key {
+            return Err(NftError::MetadataMismatch.into());
         }
 
-        let mut mint_data = mint.try_borrow_mut_data()?;
-        if Mint::LEN != mint_data.len() as u64 {
-            return Err(ProgramError::InvalidAccountData);
+        let metaplex_pid = metaplex_token_metadata::id();
+        let master_ed_seed_keys = &[
+            &metaplex_token_metadata::state::PREFIX.as_bytes(),
+            metaplex_pid.as_ref(),
+            &mint_info.key.as_ref(),
+            &metaplex_token_metadata::state::EDITION.as_bytes(),
+        ];
+        let _ = assert_derivation(program_id, master_edition_info, master_ed_seed_keys)?;
+
+        let master_edition = &metaplex_token_metadata::state::MasterEditionV2::from_account_info(master_edition_info)?;
+        if master_edition.key != metaplex_token_metadata::state::Key::MasterEditionV2 || master_edition.supply > 0 {
+            return Err(NftError::WrongEdition.into());
+        }
+        let mut found = false;
+        if let Some(creators) = metadata.data.creators {
+            for i in 0..creators.len() {
+                if creators[i].address == *pda_relayer_account.key {
+                    found = true;
+                }
+            }
+            if !found {
+                return Err(NftError::SatelliteMustListAmongCreators.into());
+            }
         }
 
-        let mut mint_state = Mint::try_from_slice(&mint_data)?;
-        if mint_state.version != MintVersion::Uninitialized {
-            return Err(ProgramError::AccountAlreadyInitialized);
-        }
-
-        // update
-        mint_state.symbol = data.symbol;
-        mint_state.name = data.name;
-        mint_state.authority = *authority.key;
-
-        mint_state.serialize(&mut mint_data.as_mut())?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn process_initialize_token(
-        program_id: &Pubkey,
-        token_account: &AccountInfo,
-        token_data_account: &AccountInfo,
-        mint: &AccountInfo,
-        data: TokenDataArgs,
-        owner: &AccountInfo,
-        rent: &AccountInfo,
-        mint_authority: &AccountInfo,
-    ) -> ProgramResult {
-        validate_program(&program_id, &token_account)?;
-        validate_program(&program_id, &token_data_account)?;
-        validate_program(&program_id, &mint)?;
-
-        let mint_acc_data = Mint::try_from_slice(&mint.data.borrow())?;
-
-        if !mint_authority.is_signer || mint_acc_data.authority != *mint_authority.key {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
-
-        let rent = Rent::from_account_info(rent)?;
-        if !rent.is_exempt(token_account.lamports(), Token::LEN as usize)
-            || !rent.is_exempt(
-                token_data_account.lamports(),
-                super::state::TokenData::LEN as usize,
-            )
-        {
-            return Err(ProgramError::AccountNotRentExempt);
-        }
-
-        let generated_token_data_key =
-            Pubkey::create_with_seed(token_account.key, Self::TOKEN_DATA_SEED, program_id)?;
-
-        if generated_token_data_key != *token_data_account.key {
+        let &derived_associated_token_account = &spl_associated_token_account::get_associated_token_address(update_authority.key, mint_info.key);
+        if derived_associated_token_account != *user_associated_token_account.key {
             return Err(ProgramError::InvalidSeeds);
         }
 
-        {
-            // there are several patters which can be optimized:
-            // 1. read(simple deref/drop wrapper)
-            // 2. read/write (return deref wrapper which is drop on serialize call)
-            // so there will be no explicit (de)serialize (like several other places in solana with methods like `.._with_borsh`)
-            // fn from_account<T: BorshDeserialize + BorshSerialize>(v: &[u8]) -> Result<T, ProgramError> {
-            //     let mut v_mut = v;
-            //     Ok(T::deserialize(&mut v_mut)?)
-            // }
-            let mut token_data = token_account.try_borrow_mut_data()?;
-            let mut data = *token_data as &[u8];
-            let mut token_state = Token::deserialize(&mut data)?;
-
-            if token_state.version != TokenStatus::Uninitialized {
-                return Err(ProgramError::AccountAlreadyInitialized);
-            }
-
-            token_state.mint = *mint.key;
-            token_state.owner = *owner.key;
-            token_state.version = TokenStatus::Initialized;
-            token_state.serialize(&mut token_data.as_mut())?;
+        let token_account = &spl_token::state::Account::unpack_from_slice(&user_associated_token_account.data.borrow())?;
+        if token_account.amount < 1 {
+            return Err(NftError::NotOwned.into());
         }
 
-        {
-            let mut token_data_data = token_data_account.try_borrow_mut_data()?;
-            let mut data_data = *token_data_data as &[u8];
-            let mut token_data_state = super::state::TokenData::deserialize(&mut data_data)?;
+        let metadata_seed_keys = &[
+            Self::RELAYER_SEED.as_bytes(),
+            program_id.as_ref(),
+        ];
+        let _ = assert_derivation(program_id, pda_relayer_account, metadata_seed_keys)?;
 
-            if token_data_state.version != TokenDataStatus::Uninitialized {
-                return Err(ProgramError::AccountAlreadyInitialized);
-            }
-
-            let url = String::from_utf8(data.uri.to_vec())
-                .map_err(|_| ProgramError::InvalidInstructionData)?;
-            let _ = url::Url::parse(&url).map_err(|_| ProgramError::InvalidInstructionData)?;
-
-            token_data_state.hash = data.hash;
-            token_data_state.uri = data.uri;
-            token_data_state.token = *token_account.key;
-            token_data_state.version = TokenDataStatus::Initialized;
-
-            token_data_state.serialize(&mut token_data_data.as_mut())?;
-        }
-
+        // stake
+        invoke(
+            &spl_token::instruction::set_authority(
+                &spl_token::id(),
+                &user_associated_token_account.key,
+                Some(pda_relayer_account.key),
+                spl_token::instruction::AuthorityType::AccountOwner,
+                &update_authority.key,
+                &[],
+            )?,
+            &[
+                user_associated_token_account.clone(),
+                pda_relayer_account.clone(),
+                update_authority.clone(),
+                token_program.clone()
+            ],
+        )?;
         Ok(())
     }
 
-    pub fn process_transfer_token(
+    pub fn process_unstake_master_edition(
         program_id: &Pubkey,
-        token_account: &AccountInfo,
-        new_owner: &AccountInfo,
-        signer: &AccountInfo,
+        accounts: &[AccountInfo],
     ) -> ProgramResult {
-        validate_program(&program_id, &token_account)?;
-
-        if !signer.is_signer {
+        let account_info_iter = &mut accounts.iter();
+        let mint_info = next_account_info(account_info_iter)?;
+        let user_associated_token_account = next_account_info(account_info_iter)?;
+        let pda_relayer_account = next_account_info(account_info_iter)?;
+        let update_authority = next_account_info(account_info_iter)?;
+        let metadata_info = next_account_info(account_info_iter)?;
+        let master_edition_info = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
+        let metadata = metaplex_token_metadata::state::Metadata::from_account_info(metadata_info)?;
+        
+        if !update_authority.is_signer || metadata.update_authority == *update_authority.key {
             return Err(ProgramError::MissingRequiredSignature);
         }
+        if metadata.mint != *mint_info.key {
+            return Err(NftError::MetadataMismatch.into());
+        }
 
-        {
-            let mut token_data = token_account.try_borrow_mut_data()?;
-            let mut data = *token_data as &[u8];
-            let mut token_state = Token::deserialize(&mut data)?;
-            if token_state.version != TokenStatus::Initialized {
-                return Err(ProgramError::InvalidAccountData);
-            }
+        let metaplex_pid = metaplex_token_metadata::id();
+        let master_ed_seed_keys = &[
+            &metaplex_token_metadata::state::PREFIX.as_bytes(),
+            metaplex_pid.as_ref(),
+            &mint_info.key.as_ref(),
+            &metaplex_token_metadata::state::EDITION.as_bytes(),
+        ];
+        let _ = assert_derivation(program_id, master_edition_info, master_ed_seed_keys)?;
 
-            if token_state.owner == *signer.key
-                || (token_state.approval.is_some() && token_state.approval.unwrap() == *signer.key)
-            {
-                token_state.owner = *new_owner.key;
-                token_state.approval = None;
-                token_state.serialize(&mut token_data.as_mut())?;
-            } else {
-                return Err(NftError::SignerNotOwnerOrApproval.into());
+        let master_edition = &metaplex_token_metadata::state::MasterEditionV2::from_account_info(master_edition_info)?;
+        if master_edition.key != metaplex_token_metadata::state::Key::MasterEditionV2 {
+            return Err(NftError::WrongEdition.into());
+        }
+        if let Some(max_supply) = master_edition.max_supply {
+            if master_edition.supply != max_supply {
+                return Err(NftError::OngoingSales.into());
             }
         }
 
+        let &derived_associated_token_account = &spl_associated_token_account::get_associated_token_address(update_authority.key, mint_info.key);
+        if derived_associated_token_account != *user_associated_token_account.key {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        let token_account = &spl_token::state::Account::unpack_from_slice(&user_associated_token_account.data.borrow())?;
+        if token_account.amount != 1 {
+            return Err(NftError::NotOwned.into());
+        }
+
+        let metadata_seed_keys = &[
+            Self::RELAYER_SEED.as_bytes(),
+            program_id.as_ref(),
+        ];
+        let bump_seed = assert_derivation(program_id, pda_relayer_account, metadata_seed_keys)?;
+        let signature = &[
+            Self::RELAYER_SEED.as_bytes(),
+            program_id.as_ref(),
+            &[bump_seed],
+        ];
+
+        // stake
+        invoke_signed(
+            &spl_token::instruction::set_authority(
+                &spl_token::id(),
+                &user_associated_token_account.key,
+                Some(update_authority.key),
+                spl_token::instruction::AuthorityType::AccountOwner,
+                &pda_relayer_account.key,
+                &[],
+            )?,
+            &[
+                user_associated_token_account.clone(),
+                update_authority.clone(),
+                pda_relayer_account.clone(),
+                token_program.clone()
+            ],
+            &[signature]
+        )?;
         Ok(())
     }
 
-    pub fn process_approve(
+    pub fn process_mint_new_edition(
         program_id: &Pubkey,
-        token_account: &AccountInfo,
-        new_approval: &AccountInfo,
-        signer: &AccountInfo,
+        accounts: &[AccountInfo],
+        edition: u64,
     ) -> ProgramResult {
-        validate_program(&program_id, &token_account)?;
+        let account_info_iter = &mut accounts.iter();
+        let edition_metadata_info = next_account_info(account_info_iter)?;
+        let edition_info = next_account_info(account_info_iter)?;
+        let master_edition_info = next_account_info(account_info_iter)?;
+        let edition_mint_info = next_account_info(account_info_iter)?;
+        let edition_update_authority = next_account_info(account_info_iter)?;
+        let pda_relayer_account = next_account_info(account_info_iter)?;
+        let creator_associated_token_account = next_account_info(account_info_iter)?;
+        let master_metadata_info = next_account_info(account_info_iter)?;
+        let master_mint_info = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
+        let metaplex_program = next_account_info(account_info_iter)?;
+        let rent_account_info = next_account_info(account_info_iter)?;
 
-        if !signer.is_signer {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
+        // INSERT HERE PAYMENT LOGIC
 
-        {
-            let mut token_data = token_account.try_borrow_mut_data()?;
-            let mut data = *token_data as &[u8];
-            let mut token_state = Token::deserialize(&mut data)?;
+        let metadata_seed_keys = &[
+            Self::RELAYER_SEED.as_bytes(),
+            program_id.as_ref(),
+        ];
+        let bump_seed = assert_derivation(program_id, pda_relayer_account, metadata_seed_keys)?;
+        let signature = &[
+            Self::RELAYER_SEED.as_bytes(),
+            program_id.as_ref(),
+            &[bump_seed],
+        ];
 
-            if token_state.version != TokenStatus::Initialized {
-                return Err(ProgramError::InvalidAccountData);
-            }
-
-            if token_state.owner == *signer.key
-                || (token_state.approval.is_some() && token_state.approval.unwrap() == *signer.key)
-            {
-                token_state.approval = Some(*new_approval.key);
-                token_state.serialize(&mut token_data.as_mut())?;
-            } else {
-                return Err(NftError::SignerNotOwnerOrApproval.into());
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn process_burn(
-        program_id: &Pubkey,
-        token_account: &AccountInfo,
-        token_data_account: &AccountInfo,
-        signer: &AccountInfo,
-    ) -> ProgramResult {
-        validate_program(&program_id, &token_account)?;
-
-        if !signer.is_signer {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
-
-        {
-            let token_data = token_account.try_borrow_mut_data()?;
-            let mut data = *token_data as &[u8];
-            let token_state = Token::deserialize(&mut data)?;
-
-            if token_state.version != TokenStatus::Initialized {
-                return Err(ProgramError::InvalidAccountData);
-            }
-
-            let token_data_data = token_data_account.try_borrow_mut_data()?;
-            let mut data_data = *token_data_data as &[u8];
-            let token_data_state = crate::state::TokenData::deserialize(&mut data_data)?;
-            if (token_state.owner == *signer.key
-                || (token_state.approval.is_some() && token_state.approval.unwrap() == *signer.key))
-                && token_data_state.token == *token_account.key
-            {
-                let lamports = token_account.try_borrow_mut_lamports()?;
-                transfer_lamports(signer, lamports)?;
-
-                let lamports = token_data_account.try_borrow_mut_lamports()?;
-                transfer_lamports(signer, lamports)?;
-            } else {
-                return Err(NftError::SignerNotOwnerOrApproval.into());
-            }
-        }
-
+        invoke_signed(
+            &metaplex_token_metadata::instruction::mint_new_edition_from_master_edition_via_token(
+                metaplex_token_metadata::id(),
+                *edition_metadata_info.key,
+                *edition_info.key,
+                *master_edition_info.key,
+                *edition_mint_info.key,
+                *edition_update_authority.key,
+                *edition_update_authority.key,
+                *pda_relayer_account.key,
+                *creator_associated_token_account.key,
+                *edition_update_authority.key,
+                *master_metadata_info.key,
+                *master_mint_info.key,
+                edition
+            ),
+            &[
+                edition_metadata_info.clone(),
+                edition_info.clone(),
+                master_edition_info.clone(),
+                edition_mint_info.clone(),
+                edition_update_authority.clone(),
+                edition_update_authority.clone(),
+                pda_relayer_account.clone(),
+                creator_associated_token_account.clone(),
+                edition_update_authority.clone(),
+                master_metadata_info.clone(),
+                master_mint_info.clone(),
+                token_program.clone(),
+                system_program.clone(),
+                metaplex_program.clone(),
+                rent_account_info.clone()
+            ],
+            &[signature]
+        )?;
         Ok(())
     }
 
@@ -262,64 +274,51 @@ impl Processor {
         let instruction =
             NftInstruction::try_from_slice(input).or(Err(ProgramError::InvalidInstructionData))?;
         match instruction {
-            NftInstruction::InitializeMint(data) => {
-                if let [mint, rent, signer, ..] = accounts {
-                    Self::process_initialize_mint(program_id, mint, data, rent, signer)
-                } else {
-                    Err(ProgramError::NotEnoughAccountKeys)
-                }
+            NftInstruction::StakeMasterEdition => {
+                msg!("Instruction: StakeMasterEdition");
+                Self::process_stake_master_edition(program_id, accounts)
             }
-            NftInstruction::InitializeToken(data) => {
-                if let [token, token_data, mint, rent, owner, signer, ..] = accounts {
-                    Self::process_initialize_token(
-                        program_id, token, token_data, mint, data, owner, rent, signer,
-                    )
-                } else {
-                    Err(ProgramError::NotEnoughAccountKeys)
-                }
+            NftInstruction::UnstakeMasterEdition => {
+                msg!("Instruction: UnstakeMasterEdition");
+                Self::process_unstake_master_edition(program_id, accounts)
             }
-            NftInstruction::Transfer => {
-                if let [token, new_owner, signer, ..] = accounts {
-                    Self::process_transfer_token(program_id, token, new_owner, signer)
-                } else {
-                    Err(ProgramError::NotEnoughAccountKeys)
-                }
-            }
-            NftInstruction::Approve => {
-                if let [token, new_approval, signer, ..] = accounts {
-                    Self::process_approve(program_id, token, new_approval, signer)
-                } else {
-                    Err(ProgramError::NotEnoughAccountKeys)
-                }
-            }
-            NftInstruction::Burn => {
-                if let [token, token_data, signer, ..] = accounts {
-                    Self::process_burn(program_id, token, token_data, signer)
-                } else {
-                    Err(ProgramError::NotEnoughAccountKeys)
-                }
+            NftInstruction::MintNewEdition(edition) => {
+                msg!("Instruction: UnstakeMasterEdition");
+                Self::process_mint_new_edition(program_id, accounts, edition)
             }
         }
     }
 }
 
-fn transfer_lamports(
-    signer: &AccountInfo,
-    mut lamports: std::cell::RefMut<&mut u64>,
-) -> Result<(), ProgramError> {
-    let mut thanks_for_cleaning_garbage = signer.try_borrow_mut_lamports()?;
-    let value = (**thanks_for_cleaning_garbage)
-        .checked_add(**lamports)
-        .ok_or(NftError::Overflow)?;
-    **thanks_for_cleaning_garbage = value;
-    **lamports = 0;
-    Ok(())
-}
+// fn transfer_lamports(
+//     signer: &AccountInfo,
+//     mut lamports: std::cell::RefMut<&mut u64>,
+// ) -> Result<(), ProgramError> {
+//     let mut thanks_for_cleaning_garbage = signer.try_borrow_mut_lamports()?;
+//     let value = (**thanks_for_cleaning_garbage)
+//         .checked_add(**lamports)
+//         .ok_or(NftError::Overflow)?;
+//     **thanks_for_cleaning_garbage = value;
+//     **lamports = 0;
+//     Ok(())
+// }
 
-fn validate_program(program_id: &Pubkey, account: &AccountInfo) -> ProgramResult {
-    if program_id != account.owner {
-        return Err(ProgramError::IncorrectProgramId);
+// fn validate_program(program_id: &Pubkey, account: &AccountInfo) -> ProgramResult {
+//     if program_id != account.owner {
+//         return Err(ProgramError::IncorrectProgramId);
+//     }
+
+//     Ok(())
+// }
+
+pub fn assert_derivation(
+    program_id: &Pubkey,
+    account: &AccountInfo,
+    path: &[&[u8]],
+) -> Result<u8, ProgramError> {
+    let (key, bump) = Pubkey::find_program_address(&path, program_id);
+    if key != *account.key {
+        return Err(ProgramError::InvalidSeeds);
     }
-
-    Ok(())
+    Ok(bump)
 }
